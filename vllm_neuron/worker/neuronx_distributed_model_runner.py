@@ -28,7 +28,12 @@ from vllm.v1.core.sched.output import (
     SchedulerOutput,
     GrammarOutput,
 )
-from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCacheSpec
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    KVCacheConfig,
+    KVCacheSpec,
+    MambaSpec,
+)
 from vllm.v1.outputs import (
     EMPTY_MODEL_RUNNER_OUTPUT,
     DraftTokenIds,
@@ -48,6 +53,22 @@ from vllm_neuron.worker.utils import get_num_layers_from_hf_config
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
+
+
+def _linear_attention_state_shapes(hf_config) -> tuple[tuple[int, ...], ...]:
+    """Per-sequence state shapes for a Gated DeltaNet linear-attention layer:
+    a causal-conv state and a recurrent state (both constant in seq length)."""
+    conv_dim = (
+        hf_config.linear_key_head_dim * hf_config.linear_num_key_heads * 2
+        + hf_config.linear_value_head_dim * hf_config.linear_num_value_heads
+    )
+    conv_state_shape = (conv_dim, hf_config.linear_conv_kernel_dim - 1)
+    recurrent_state_shape = (
+        hf_config.linear_num_value_heads,
+        hf_config.linear_key_head_dim,
+        hf_config.linear_value_head_dim,
+    )
+    return (conv_state_shape, recurrent_state_shape)
 
 
 def _mm_kwargs_to_device(
@@ -899,20 +920,41 @@ class NeuronxDistributedModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunner
             format. Layers that do not need KV cache are not included.
         """
         # Get number of layers from model config
-        num_layers = get_num_layers_from_hf_config(self.model_config.hf_config)
+        hf_config = self.model_config.hf_config
+        num_layers = get_num_layers_from_hf_config(hf_config)
+        layer_types = getattr(hf_config, "layer_types", None)
+        if not isinstance(layer_types, (list, tuple)):
+            layer_types = None
 
         kv_cache_spec: dict[str, KVCacheSpec] = {}
 
         # Create a spec for each layer
         for layer_idx in range(num_layers):
-            layer_name = f"layers.{layer_idx}.self_attn"  # standard naming convention
-            kv_cache_spec[layer_name] = FullAttentionSpec(
-                block_size=self.block_size,
-                num_kv_heads=self.parallel_config.tensor_parallel_size,
-                head_size=self.model.head_dim,
-                dtype=self.model_config.dtype,
-                sliding_window=self.model_config.get_sliding_window(),
+            layer_type = (
+                layer_types[layer_idx] if layer_types is not None else "full_attention"
             )
+            if layer_type == "linear_attention":
+                # Hybrid models (e.g. Qwen3.5 / Qwen3-Next Gated DeltaNet):
+                # constant-size per-sequence state instead of a growing KV
+                # cache. Declare a Mamba-style spec so vLLM's KV cache
+                # manager accounts for the real (constant) footprint.
+                kv_cache_spec[f"layers.{layer_idx}.linear_attn"] = MambaSpec(
+                    block_size=self.block_size,
+                    shapes=_linear_attention_state_shapes(hf_config),
+                    dtypes=(torch.float32, torch.float32),
+                    mamba_type="linear_attention",
+                )
+            else:
+                layer_name = (
+                    f"layers.{layer_idx}.self_attn"  # standard naming convention
+                )
+                kv_cache_spec[layer_name] = FullAttentionSpec(
+                    block_size=self.block_size,
+                    num_kv_heads=self.parallel_config.tensor_parallel_size,
+                    head_size=self.model.head_dim,
+                    dtype=self.model_config.dtype,
+                    sliding_window=self.model_config.get_sliding_window(),
+                )
 
         return kv_cache_spec
 

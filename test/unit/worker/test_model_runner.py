@@ -1012,6 +1012,50 @@ class TestModelRunner:
         )
         assert spec["layers.0.self_attn"].head_size == model_runner.model.head_dim
 
+    def test_get_kv_cache_spec_hybrid_linear_attention(self, model_runner):
+        """Test KV cache spec generation for hybrid linear-attention models
+        (e.g. Qwen3.5 / Qwen3-Next).
+
+        Verifies that:
+        1. Full-attention layers get a FullAttentionSpec
+        2. Linear-attention (Gated DeltaNet) layers get a constant-size
+           MambaSpec with conv + recurrent state shapes
+        """
+        from transformers import PretrainedConfig
+        from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
+
+        hybrid_layer_types = (["linear_attention"] * 3 + ["full_attention"]) * 8
+        model_runner.model_config.hf_config = PretrainedConfig(
+            num_hidden_layers=32,
+            hidden_size=4096,
+            vocab_size=32000,
+            num_attention_heads=32,
+            num_key_value_heads=8,
+            layer_types=hybrid_layer_types,
+            linear_num_value_heads=32,
+            linear_num_key_heads=16,
+            linear_key_head_dim=128,
+            linear_value_head_dim=128,
+            linear_conv_kernel_dim=4,
+        )
+        model_runner.model_config.dtype = torch.float16
+
+        spec = model_runner.get_kv_cache_spec()
+        assert len(spec) == 32
+
+        for layer_idx, layer_type in enumerate(hybrid_layer_types):
+            if layer_type == "linear_attention":
+                layer_spec = spec[f"layers.{layer_idx}.linear_attn"]
+                assert isinstance(layer_spec, MambaSpec)
+                conv_dim = 128 * 16 * 2 + 128 * 32
+                assert layer_spec.shapes == ((conv_dim, 3), (32, 128, 128))
+                assert layer_spec.dtypes == (torch.float32, torch.float32)
+                assert layer_spec.mamba_type == "linear_attention"
+            else:
+                layer_spec = spec[f"layers.{layer_idx}.self_attn"]
+                assert isinstance(layer_spec, FullAttentionSpec)
+                assert layer_spec.block_size == model_runner.block_size
+
     def test_scheduler_output_args(self):
         """Test SchedulerOutput argument handling.
 
