@@ -899,19 +899,45 @@ class NeuronxDistributedModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunner
             format. Layers that do not need KV cache are not included.
         """
         # Get number of layers from model config
-        num_layers = get_num_layers_from_hf_config(self.model_config.hf_config)
+        hf_config = self.model_config.hf_config
+        text_config = (
+            hf_config.text_config if hasattr(hf_config, "text_config") else hf_config
+        )
+        num_layers = get_num_layers_from_hf_config(text_config)
+        layer_types = (
+            text_config.layer_types if hasattr(text_config, "layer_types") else None
+        )
+        default_sliding_window = self.model_config.get_sliding_window()
+        default_head_size = self.model.head_dim
 
         kv_cache_spec: dict[str, KVCacheSpec] = {}
 
         # Create a spec for each layer
         for layer_idx in range(num_layers):
             layer_name = f"layers.{layer_idx}.self_attn"  # standard naming convention
+            layer_type = layer_types[layer_idx] if layer_types is not None else None
+            sliding_window = default_sliding_window
+            if layer_type is not None:
+                sliding_window = (
+                    text_config.sliding_window
+                    if layer_type == "sliding_attention"
+                    and hasattr(text_config, "sliding_window")
+                    else None
+                )
+            head_size = default_head_size
+            if layer_type == "full_attention" and hasattr(
+                text_config, "global_head_dim"
+            ):
+                head_size = text_config.global_head_dim
+            elif layer_type == "sliding_attention" and hasattr(text_config, "head_dim"):
+                head_size = text_config.head_dim
+
             kv_cache_spec[layer_name] = FullAttentionSpec(
                 block_size=self.block_size,
                 num_kv_heads=self.parallel_config.tensor_parallel_size,
-                head_size=self.model.head_dim,
+                head_size=head_size,
                 dtype=self.model_config.dtype,
-                sliding_window=self.model_config.get_sliding_window(),
+                sliding_window=sliding_window,
             )
 
         return kv_cache_spec
