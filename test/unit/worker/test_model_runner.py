@@ -1012,6 +1012,22 @@ class TestModelRunner:
         )
         assert spec["layers.0.self_attn"].head_size == model_runner.model.head_dim
 
+    def test_get_kv_cache_spec_uses_per_layer_sliding_window(self, model_runner):
+        from transformers import PretrainedConfig
+
+        model_runner.model_config.hf_config = PretrainedConfig(
+            num_hidden_layers=3,
+            layer_types=["sliding_attention", "full_attention", "sliding_attention"],
+            sliding_window=512,
+        )
+        model_runner.model_config.get_sliding_window.return_value = 512
+
+        spec = model_runner.get_kv_cache_spec()
+
+        assert spec["layers.0.self_attn"].sliding_window == 512
+        assert spec["layers.1.self_attn"].sliding_window is None
+        assert spec["layers.2.self_attn"].sliding_window == 512
+
     def test_scheduler_output_args(self):
         """Test SchedulerOutput argument handling.
 

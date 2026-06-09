@@ -50,6 +50,24 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
 
+def _get_text_config(hf_config):
+    if hasattr(hf_config, "get_text_config"):
+        return hf_config.get_text_config()
+    return getattr(hf_config, "text_config", hf_config)
+
+
+def _get_sliding_window_for_layer(
+    hf_config, layer_idx: int, default_sliding_window: int | None
+):
+    text_config = _get_text_config(hf_config)
+    layer_types = getattr(text_config, "layer_types", None)
+    if layer_types is None:
+        return default_sliding_window
+    if layer_types[layer_idx] == "sliding_attention":
+        return getattr(text_config, "sliding_window", default_sliding_window)
+    return None
+
+
 def _mm_kwargs_to_device(
     mm_kwargs: dict | None,
     device: torch.types.Device,
@@ -911,7 +929,11 @@ class NeuronxDistributedModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunner
                 num_kv_heads=self.parallel_config.tensor_parallel_size,
                 head_size=self.model.head_dim,
                 dtype=self.model_config.dtype,
-                sliding_window=self.model_config.get_sliding_window(),
+                sliding_window=_get_sliding_window_for_layer(
+                    self.model_config.hf_config,
+                    layer_idx,
+                    self.model_config.get_sliding_window(),
+                ),
             )
 
         return kv_cache_spec
