@@ -1012,6 +1012,40 @@ class TestModelRunner:
         )
         assert spec["layers.0.self_attn"].head_size == model_runner.model.head_dim
 
+    def test_get_kv_cache_spec_gemma4_mixed_attention(self, model_runner):
+        """Test per-layer Gemma 4 KV specs for mixed local/global attention."""
+        from transformers import PretrainedConfig
+
+        model_runner.model_config.hf_config = PretrainedConfig(
+            text_config=PretrainedConfig(
+                num_hidden_layers=4,
+                hidden_size=128,
+                vocab_size=1024,
+                num_attention_heads=4,
+                num_key_value_heads=1,
+                layer_types=[
+                    "sliding_attention",
+                    "full_attention",
+                    "sliding_attention",
+                    "full_attention",
+                ],
+                sliding_window=512,
+                head_dim=32,
+                global_head_dim=64,
+            )
+        )
+
+        spec = model_runner.get_kv_cache_spec()
+
+        assert spec["layers.0.self_attn"].head_size == 32
+        assert spec["layers.0.self_attn"].sliding_window == 512
+        assert spec["layers.1.self_attn"].head_size == 64
+        assert spec["layers.1.self_attn"].sliding_window is None
+        assert spec["layers.2.self_attn"].head_size == 32
+        assert spec["layers.2.self_attn"].sliding_window == 512
+        assert spec["layers.3.self_attn"].head_size == 64
+        assert spec["layers.3.self_attn"].sliding_window is None
+
     def test_scheduler_output_args(self):
         """Test SchedulerOutput argument handling.
 
