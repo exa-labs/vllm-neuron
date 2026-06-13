@@ -970,6 +970,9 @@ def _get_neuron_model_cls(architecture: str):
             if model == "qwen3vl":
                 model = "qwen3_vl"
 
+            if model == "qwen3next":
+                model = "qwen3_next"
+
             if architecture == "LlavaForConditionalGeneration":
                 model = "pixtral"
 
