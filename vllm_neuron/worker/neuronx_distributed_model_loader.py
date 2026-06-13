@@ -486,6 +486,7 @@ class NeuronCausalLM(NeuronModelBase):
         position_ids = inputs.get("position_ids")
         sampling_params = inputs.get("sampling_params")
         adapter_ids = inputs.get("adapter_ids")
+        batch_size = input_ids.shape[0]
         seq_len = input_ids.shape[1]
         num_passes = (seq_len + max_cte - 1) // max_cte
 
@@ -493,12 +494,18 @@ class NeuronCausalLM(NeuronModelBase):
         for i in range(num_passes):
             start = i * max_cte
             end = min(start + max_cte, seq_len)
+            chunk_len = end - start
             chunk_ids = input_ids[:, start:end]
             chunk_pos = position_ids[:, start:end] if position_ids is not None else None
+            # ModelWrapper.pad_inputs expects attention_mask as args[1] with
+            # shape (batch, seq_len).  All tokens in each chunk are valid.
+            chunk_mask = torch.ones(
+                (batch_size, chunk_len), dtype=torch.long, device=input_ids.device
+            )
 
             output = self.model.context_encoding_model(
                 chunk_ids,
-                None,  # attention_mask
+                chunk_mask,
                 chunk_pos,
                 sorted_ids,
                 sampling_params,
