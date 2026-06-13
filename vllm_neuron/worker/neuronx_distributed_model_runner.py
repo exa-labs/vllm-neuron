@@ -213,10 +213,14 @@ class NeuronxDistributedModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunner
         sample_start = time.perf_counter()
 
         if self._cached_logits is None:
-            raise RuntimeError(
-                "sample_tokens() called without prior execute_model(). "
-                "Logits must be cached first."
+            # Return None so the V1 engine's batch-queue can surface the real
+            # error from execute_model via exec_model_fut.result().
+            logger.error(
+                "sample_tokens() called but _cached_logits is None — "
+                "execute_model likely raised. Returning None to propagate "
+                "the original exception."
             )
+            return None
 
         hidden_states = self._cached_logits
         model_input = self._cached_model_input
@@ -765,16 +769,26 @@ class NeuronxDistributedModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunner
         ):
             # Execute model forward pass (no sampling - deferred to sample_tokens())
             model_exec_start = time.perf_counter()
-            if self.model.architecture in NEURON_MULTI_MODAL_MODELS:
-                hidden_states = self._execute_model_for_multimodal_models(
-                    model_input,
-                    intermediate_tensors,
+            try:
+                if self.model.architecture in NEURON_MULTI_MODAL_MODELS:
+                    hidden_states = self._execute_model_for_multimodal_models(
+                        model_input,
+                        intermediate_tensors,
+                    )
+                else:
+                    hidden_states = self._execute_model_for_text(
+                        model_input,
+                        intermediate_tensors,
+                    )
+            except Exception:
+                logger.exception(
+                    "execute_model forward FAILED (input_tokens shape=%s, "
+                    "is_prefill=%s, total_scheduled=%d)",
+                    model_input.input_tokens.shape if model_input.input_tokens is not None else None,
+                    model_input.input_tokens.shape[1] > 1 if model_input.input_tokens is not None else None,
+                    scheduler_output.total_num_scheduled_tokens,
                 )
-            else:
-                hidden_states = self._execute_model_for_text(
-                    model_input,
-                    intermediate_tensors,
-                )
+                raise
             model_exec_elapsed = (time.perf_counter() - model_exec_start) * 1000
             logger.debug("[PERF] model_execution: %.2fms", model_exec_elapsed)
 
