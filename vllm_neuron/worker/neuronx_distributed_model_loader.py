@@ -509,7 +509,7 @@ class NeuronCausalLM(NeuronModelBase):
                 chunk_pos,
                 sorted_ids,
                 sampling_params,
-                torch.empty(0),  # prev_hidden
+                torch.zeros(batch_size),  # prev_hidden (must match compiled shape)
                 adapter_ids,
             )
         self.model.kv_cache_populated = True
