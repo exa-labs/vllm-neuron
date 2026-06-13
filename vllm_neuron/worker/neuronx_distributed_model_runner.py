@@ -696,7 +696,18 @@ class NeuronxDistributedModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunner
                     f'"max_context_length": {mpl_value} in override_neuron_config when compiling.'
                 )
 
-        self.max_prompt_length = mpl_nc_value
+        # When multi-pass CTE is enabled (NeuronCausalLM splits long prompts
+        # into max_context_length chunks in forward()), allow prompts up to
+        # max_model_len through the scheduler.
+        if mpl_nc_value and mpl_nc_value < self.max_model_len:
+            logger.info(
+                "Multi-pass CTE enabled: max_prompt_length overridden from %d "
+                "to max_model_len=%d (prompts will be chunked in forward()).",
+                mpl_nc_value, self.max_model_len,
+            )
+            self.max_prompt_length = self.max_model_len
+        else:
+            self.max_prompt_length = mpl_nc_value
 
     @torch.inference_mode()
     def execute_model(

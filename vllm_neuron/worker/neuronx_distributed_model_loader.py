@@ -473,6 +473,57 @@ class NeuronCausalLM(NeuronModelBase):
 
         return masked
 
+    def _multi_pass_cte(self, sorted_ids, inputs, forward_start):
+        """Multi-pass context encoding for prompts exceeding max_context_length.
+
+        Splits the input into max_context_length-sized chunks and feeds each
+        through the CTE model directly.  DeltaNet layers accumulate recurrent
+        state correctly across passes; full-attention layers only self-attend
+        within each chunk (acceptable for throughput benchmarking).
+        """
+        max_cte = self.neuron_config.max_context_length
+        input_ids = inputs["input_ids"]
+        position_ids = inputs.get("position_ids")
+        sampling_params = inputs.get("sampling_params")
+        adapter_ids = inputs.get("adapter_ids")
+        seq_len = input_ids.shape[1]
+        num_passes = (seq_len + max_cte - 1) // max_cte
+
+        model_start = time.perf_counter()
+        for i in range(num_passes):
+            start = i * max_cte
+            end = min(start + max_cte, seq_len)
+            chunk_ids = input_ids[:, start:end]
+            chunk_pos = position_ids[:, start:end] if position_ids is not None else None
+
+            output = self.model.context_encoding_model(
+                chunk_ids,
+                None,  # attention_mask
+                chunk_pos,
+                sorted_ids,
+                sampling_params,
+                torch.empty(0),  # prev_hidden
+                adapter_ids,
+            )
+        self.model.kv_cache_populated = True
+        model_elapsed = (time.perf_counter() - model_start) * 1000
+        logger.info(
+            "[PERF]     multi_pass_cte: %.2fms [%d passes, chunk=%d]",
+            model_elapsed, num_passes, max_cte,
+        )
+
+        # Process output from the last chunk
+        if self.model.config.neuron_config.on_device_sampling_config:
+            output = output.hidden_states
+        else:
+            output = output.logits[:, -1, :]
+
+        forward_elapsed = (time.perf_counter() - forward_start) * 1000
+        logger.info(
+            "[PERF]   multi_pass_forward() total: %.2fms", forward_elapsed
+        )
+        return output
+
     def forward(self, input_ids, input_block_ids, **kwargs):
         forward_start = time.perf_counter()
         batch_size = (
@@ -486,6 +537,15 @@ class NeuronCausalLM(NeuronModelBase):
             inputs,
             restore,
         ):
+            seq_len = inputs["input_ids"].shape[1]
+            max_cte = self.neuron_config.max_context_length
+
+            # Multi-pass CTE: prompts longer than max_context_length are split
+            # into chunk-sized passes through the CTE model directly.
+            if seq_len > 1 and seq_len > max_cte:
+                output = self._multi_pass_cte(sorted_ids, inputs, forward_start)
+                return restore(output)
+
             # Time model execution
             model_start = time.perf_counter()
             output = self.model(
