@@ -550,11 +550,10 @@ class NeuronCausalLM(NeuronModelBase):
             f"[multi_pass_cte] Done: {model_elapsed:.1f}ms total", flush=True
         )
 
-        # Process output from the last chunk
-        if self.model.config.neuron_config.on_device_sampling_config:
-            output = output.hidden_states
-        else:
-            output = output.logits[:, -1, :]
+        # context_encoding_model() returns the raw tensor directly (sampled
+        # token IDs when on_device_sampling, full logits otherwise).
+        if not self.model.config.neuron_config.on_device_sampling_config:
+            output = output[:, -1, :]
 
         forward_elapsed = (time.perf_counter() - forward_start) * 1000
         logger.info(
