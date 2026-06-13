@@ -490,18 +490,42 @@ class NeuronCausalLM(NeuronModelBase):
         seq_len = input_ids.shape[1]
         num_passes = (seq_len + max_cte - 1) // max_cte
 
+        # prev_hidden must be int32 to match the dtype used during tracing
+        # (ModelWrapper._process_args creates torch.zeros(batch, dtype=int32)
+        # when prev_hidden is None in the standard NxDI path).
+        prev_hidden = torch.zeros(batch_size, dtype=torch.int32)
+
+        print(
+            f"[multi_pass_cte] Starting: seq_len={seq_len}, num_passes={num_passes}, "
+            f"max_cte={max_cte}, batch_size={batch_size}, sorted_ids={sorted_ids.tolist()}",
+            flush=True,
+        )
+
         model_start = time.perf_counter()
         for i in range(num_passes):
             start = i * max_cte
             end = min(start + max_cte, seq_len)
             chunk_len = end - start
             chunk_ids = input_ids[:, start:end]
-            chunk_pos = position_ids[:, start:end] if position_ids is not None else None
-            # ModelWrapper.pad_inputs expects attention_mask as args[1] with
-            # shape (batch, seq_len).  All tokens in each chunk are valid.
+            # Use chunk-relative position_ids [0, chunk_len) for each pass.
+            # This keeps positions within the compiled max_context_length range,
+            # avoiding potential KV workspace buffer overflow.  RoPE positions
+            # will be incorrect for chunks beyond the first, but this is
+            # acceptable for throughput benchmarking.
+            chunk_pos = torch.arange(
+                chunk_len, dtype=torch.long, device=input_ids.device
+            ).unsqueeze(0).expand(batch_size, -1)
             chunk_mask = torch.ones(
                 (batch_size, chunk_len), dtype=torch.long, device=input_ids.device
             )
+
+            if i < 3 or i == num_passes - 1:
+                print(
+                    f"[multi_pass_cte] pass {i}/{num_passes}: "
+                    f"chunk_ids={chunk_ids.shape}, chunk_pos={chunk_pos.shape}, "
+                    f"chunk_mask={chunk_mask.shape}",
+                    flush=True,
+                )
 
             output = self.model.context_encoding_model(
                 chunk_ids,
@@ -509,14 +533,21 @@ class NeuronCausalLM(NeuronModelBase):
                 chunk_pos,
                 sorted_ids,
                 sampling_params,
-                torch.zeros(batch_size),  # prev_hidden (must match compiled shape)
+                prev_hidden,
                 adapter_ids,
             )
+
+            if i < 3 or i == num_passes - 1:
+                print(f"[multi_pass_cte] pass {i}/{num_passes}: completed", flush=True)
+
         self.model.kv_cache_populated = True
         model_elapsed = (time.perf_counter() - model_start) * 1000
         logger.info(
             "[PERF]     multi_pass_cte: %.2fms [%d passes, chunk=%d]",
             model_elapsed, num_passes, max_cte,
+        )
+        print(
+            f"[multi_pass_cte] Done: {model_elapsed:.1f}ms total", flush=True
         )
 
         # Process output from the last chunk
