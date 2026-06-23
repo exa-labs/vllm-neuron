@@ -272,22 +272,33 @@ class TestNeuronScheduler:
     def test_max_prompt_batch_size_constraint(self, scheduler):
         """Test enforcement of maximum prompt batch size.
 
-        This test verifies:
-        1. Scheduler respects max_prompt_batch_size limit
-        2. Additional requests are rejected when limit reached
-        3. Batch size constraints are properly enforced
+        Default max_prompt_batch_size equals max_num_running_reqs (batch
+        prefill). The env var NEURON_MAX_PROMPT_BATCH_SIZE can restrict it.
 
         Args:
             scheduler: Fixture providing configured scheduler instance
         """
-        # Fill waiting queue to max_prompt_batch_size
-        scheduler.waiting.append(Mock())
+        import os
 
-        # Try to schedule another request
+        # Default: batch prefill allows up to max_num_running_reqs in waiting
+        scheduler.waiting.append(Mock())
         mock_request = Mock()
         result = scheduler.can_schedule(mock_request)
+        assert result, "Default batch prefill should allow multiple in waiting"
 
-        assert not result, "Should not schedule when max_prompt_batch_size reached"
+        # Fill waiting to max_num_running_reqs → should reject
+        scheduler.waiting.clear()
+        for _ in range(scheduler.max_num_running_reqs):
+            scheduler.waiting.append(Mock())
+        result = scheduler.can_schedule(mock_request)
+        assert not result, "Should reject when waiting == max_num_running_reqs"
+
+        # Env var override restricts batch size
+        scheduler.waiting.clear()
+        scheduler.waiting.append(Mock())
+        with patch.dict(os.environ, {"NEURON_MAX_PROMPT_BATCH_SIZE": "1"}):
+            result = scheduler.can_schedule(mock_request)
+        assert not result, "Should reject when env var restricts to 1"
 
     def test_context_length_handling(self, scheduler):
         """Test request handling with different context lengths.
