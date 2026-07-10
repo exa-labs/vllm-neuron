@@ -61,6 +61,16 @@ from vllm_neuron.worker.constants import (
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
+# VLLM_NEURON_PERF_DEBUG=1 surfaces the [PERF] logger.debug breakdowns
+# (forward, output processing, reorder/restore timing) regardless of the
+# process logging config.
+if os.environ.get("VLLM_NEURON_PERF_DEBUG", "0") == "1":
+    logger.setLevel(logging.DEBUG)
+    _perf_handler = logging.StreamHandler()
+    _perf_handler.setLevel(logging.DEBUG)
+    logger.addHandler(_perf_handler)
+    logger.propagate = False
+
 
 class NeuronModelBase(nn.Module):
     """
@@ -473,6 +483,94 @@ class NeuronCausalLM(NeuronModelBase):
 
         return masked
 
+    def _multi_pass_cte(self, sorted_ids, inputs, forward_start):
+        """Multi-pass context encoding for prompts exceeding max_context_length.
+
+        Splits the input into max_context_length-sized chunks and feeds each
+        through the CTE model directly.  DeltaNet layers accumulate recurrent
+        state correctly across passes; full-attention layers only self-attend
+        within each chunk (acceptable for throughput benchmarking).
+        """
+        max_cte = self.neuron_config.max_context_length
+        input_ids = inputs["input_ids"]
+        position_ids = inputs.get("position_ids")
+        sampling_params = inputs.get("sampling_params")
+        adapter_ids = inputs.get("adapter_ids")
+        batch_size = input_ids.shape[0]
+        seq_len = input_ids.shape[1]
+        num_passes = (seq_len + max_cte - 1) // max_cte
+
+        # prev_hidden must be int32 to match the dtype used during tracing
+        # (ModelWrapper._process_args creates torch.zeros(batch, dtype=int32)
+        # when prev_hidden is None in the standard NxDI path).
+        prev_hidden = torch.zeros(batch_size, dtype=torch.int32)
+
+        print(
+            f"[multi_pass_cte] Starting: seq_len={seq_len}, num_passes={num_passes}, "
+            f"max_cte={max_cte}, batch_size={batch_size}, sorted_ids={sorted_ids.tolist()}",
+            flush=True,
+        )
+
+        model_start = time.perf_counter()
+        for i in range(num_passes):
+            start = i * max_cte
+            end = min(start + max_cte, seq_len)
+            chunk_len = end - start
+            chunk_ids = input_ids[:, start:end]
+            # Use chunk-relative position_ids [0, chunk_len) for each pass.
+            # This keeps positions within the compiled max_context_length range,
+            # avoiding potential KV workspace buffer overflow.  RoPE positions
+            # will be incorrect for chunks beyond the first, but this is
+            # acceptable for throughput benchmarking.
+            chunk_pos = (
+                torch.arange(chunk_len, dtype=torch.long, device=input_ids.device)
+                .unsqueeze(0)
+                .expand(batch_size, -1)
+            )
+            chunk_mask = torch.ones(
+                (batch_size, chunk_len), dtype=torch.long, device=input_ids.device
+            )
+
+            if i < 3 or i == num_passes - 1:
+                print(
+                    f"[multi_pass_cte] pass {i}/{num_passes}: "
+                    f"chunk_ids={chunk_ids.shape}, chunk_pos={chunk_pos.shape}, "
+                    f"chunk_mask={chunk_mask.shape}",
+                    flush=True,
+                )
+
+            output = self.model.context_encoding_model(
+                chunk_ids,
+                chunk_mask,
+                chunk_pos,
+                sorted_ids,
+                sampling_params,
+                prev_hidden,
+                adapter_ids,
+            )
+
+            if i < 3 or i == num_passes - 1:
+                print(f"[multi_pass_cte] pass {i}/{num_passes}: completed", flush=True)
+
+        self.model.kv_cache_populated = True
+        model_elapsed = (time.perf_counter() - model_start) * 1000
+        logger.info(
+            "[PERF]     multi_pass_cte: %.2fms [%d passes, chunk=%d]",
+            model_elapsed,
+            num_passes,
+            max_cte,
+        )
+        print(f"[multi_pass_cte] Done: {model_elapsed:.1f}ms total", flush=True)
+
+        # context_encoding_model() returns the raw tensor directly (sampled
+        # token IDs when on_device_sampling, full logits otherwise).
+        if not self.model.config.neuron_config.on_device_sampling_config:
+            output = output[:, -1, :]
+
+        forward_elapsed = (time.perf_counter() - forward_start) * 1000
+        logger.info("[PERF]   multi_pass_forward() total: %.2fms", forward_elapsed)
+        return output
+
     def forward(self, input_ids, input_block_ids, **kwargs):
         forward_start = time.perf_counter()
         batch_size = (
@@ -486,6 +584,15 @@ class NeuronCausalLM(NeuronModelBase):
             inputs,
             restore,
         ):
+            seq_len = inputs["input_ids"].shape[1]
+            max_cte = self.neuron_config.max_context_length
+
+            # Multi-pass CTE: prompts longer than max_context_length are split
+            # into chunk-sized passes through the CTE model directly.
+            if seq_len > 1 and seq_len > max_cte:
+                output = self._multi_pass_cte(sorted_ids, inputs, forward_start)
+                return restore(output)
+
             # Time model execution
             model_start = time.perf_counter()
             output = self.model(
@@ -969,6 +1076,9 @@ def _get_neuron_model_cls(architecture: str):
 
             if model == "qwen3vl":
                 model = "qwen3_vl"
+
+            if model == "qwen3next":
+                model = "qwen3_next"
 
             if architecture == "LlavaForConditionalGeneration":
                 model = "pixtral"

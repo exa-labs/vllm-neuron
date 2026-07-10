@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 import logging
+import os
 from collections import deque
 from typing import TYPE_CHECKING
 
@@ -116,7 +117,17 @@ class ContinuousBatchingNeuronScheduler(NeuronScheduler):
         return outputs
 
     def can_schedule(self, request) -> bool:
-        max_prompt_batch_size = 1
+        # On Neuron the compiled model processes a fixed batch dimension
+        # (max_num_seqs) regardless of how many positions hold real data —
+        # unused positions are zero-padded.  Prefilling 1 request at a time
+        # wastes (max_num_seqs - 1) positions on padding; batching all
+        # waiting requests into a single prefill step is computationally free.
+        max_prompt_batch_size = int(
+            os.environ.get(
+                "NEURON_MAX_PROMPT_BATCH_SIZE",
+                str(self.max_num_running_reqs),
+            )
+        )
         _max_context_len = self.max_model_len
 
         # running and waiting queues are both empty -> start new batch

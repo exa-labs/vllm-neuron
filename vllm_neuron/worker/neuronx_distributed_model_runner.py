@@ -28,7 +28,11 @@ from vllm.v1.core.sched.output import (
     SchedulerOutput,
     GrammarOutput,
 )
-from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCacheSpec
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    KVCacheConfig,
+    KVCacheSpec,
+)
 from vllm.v1.outputs import (
     EMPTY_MODEL_RUNNER_OUTPUT,
     DraftTokenIds,
@@ -48,6 +52,16 @@ from vllm_neuron.worker.utils import get_num_layers_from_hf_config
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
+
+# VLLM_NEURON_PERF_DEBUG=1 surfaces the [PERF] logger.debug breakdowns
+# (per-step host-side timing: input prep, model execution, sampling, output
+# processing) regardless of the process logging config.
+if os.environ.get("VLLM_NEURON_PERF_DEBUG", "0") == "1":
+    logger.setLevel(logging.DEBUG)
+    _perf_handler = logging.StreamHandler()
+    _perf_handler.setLevel(logging.DEBUG)
+    logger.addHandler(_perf_handler)
+    logger.propagate = False
 
 
 def _mm_kwargs_to_device(
@@ -208,10 +222,14 @@ class NeuronxDistributedModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunner
         sample_start = time.perf_counter()
 
         if self._cached_logits is None:
-            raise RuntimeError(
-                "sample_tokens() called without prior execute_model(). "
-                "Logits must be cached first."
+            # Return None so the V1 engine's batch-queue can surface the real
+            # error from execute_model via exec_model_fut.result().
+            logger.error(
+                "sample_tokens() called but _cached_logits is None — "
+                "execute_model likely raised. Returning None to propagate "
+                "the original exception."
             )
+            return None
 
         hidden_states = self._cached_logits
         model_input = self._cached_model_input
@@ -691,7 +709,19 @@ class NeuronxDistributedModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunner
                     f'"max_context_length": {mpl_value} in override_neuron_config when compiling.'
                 )
 
-        self.max_prompt_length = mpl_nc_value
+        # When multi-pass CTE is enabled (NeuronCausalLM splits long prompts
+        # into max_context_length chunks in forward()), allow prompts up to
+        # max_model_len through the scheduler.
+        if mpl_nc_value and mpl_nc_value < self.max_model_len:
+            logger.info(
+                "Multi-pass CTE enabled: max_prompt_length overridden from %d "
+                "to max_model_len=%d (prompts will be chunked in forward()).",
+                mpl_nc_value,
+                self.max_model_len,
+            )
+            self.max_prompt_length = self.max_model_len
+        else:
+            self.max_prompt_length = mpl_nc_value
 
     @torch.inference_mode()
     def execute_model(
@@ -749,16 +779,30 @@ class NeuronxDistributedModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunner
         ):
             # Execute model forward pass (no sampling - deferred to sample_tokens())
             model_exec_start = time.perf_counter()
-            if self.model.architecture in NEURON_MULTI_MODAL_MODELS:
-                hidden_states = self._execute_model_for_multimodal_models(
-                    model_input,
-                    intermediate_tensors,
+            try:
+                if self.model.architecture in NEURON_MULTI_MODAL_MODELS:
+                    hidden_states = self._execute_model_for_multimodal_models(
+                        model_input,
+                        intermediate_tensors,
+                    )
+                else:
+                    hidden_states = self._execute_model_for_text(
+                        model_input,
+                        intermediate_tensors,
+                    )
+            except Exception:
+                logger.exception(
+                    "execute_model forward FAILED (input_tokens shape=%s, "
+                    "is_prefill=%s, total_scheduled=%d)",
+                    model_input.input_tokens.shape
+                    if model_input.input_tokens is not None
+                    else None,
+                    model_input.input_tokens.shape[1] > 1
+                    if model_input.input_tokens is not None
+                    else None,
+                    scheduler_output.total_num_scheduled_tokens,
                 )
-            else:
-                hidden_states = self._execute_model_for_text(
-                    model_input,
-                    intermediate_tensors,
-                )
+                raise
             model_exec_elapsed = (time.perf_counter() - model_exec_start) * 1000
             logger.debug("[PERF] model_execution: %.2fms", model_exec_elapsed)
 
@@ -899,12 +943,25 @@ class NeuronxDistributedModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunner
             format. Layers that do not need KV cache are not included.
         """
         # Get number of layers from model config
-        num_layers = get_num_layers_from_hf_config(self.model_config.hf_config)
+        hf_config = self.model_config.hf_config
+        num_layers = get_num_layers_from_hf_config(hf_config)
+        layer_types = getattr(hf_config, "layer_types", None)
+        if not isinstance(layer_types, (list, tuple)):
+            layer_types = None
 
         kv_cache_spec: dict[str, KVCacheSpec] = {}
 
-        # Create a spec for each layer
+        # Create a spec for each layer — only report attention layers.
+        # Linear-attention (DeltaNet) layers have constant-size recurrent state
+        # managed entirely by NxDI; vLLM's block manager doesn't allocate for
+        # them. Reporting MambaSpec for those layers triggers ValueError in
+        # unify_hybrid_kv_cache_specs when HMA is disabled (Neuron path).
         for layer_idx in range(num_layers):
+            layer_type = (
+                layer_types[layer_idx] if layer_types is not None else "full_attention"
+            )
+            if layer_type == "linear_attention":
+                continue
             layer_name = f"layers.{layer_idx}.self_attn"  # standard naming convention
             kv_cache_spec[layer_name] = FullAttentionSpec(
                 block_size=self.block_size,

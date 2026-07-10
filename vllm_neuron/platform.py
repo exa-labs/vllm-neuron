@@ -315,6 +315,25 @@ class NeuronPlatform(Platform):
             "max_prompt_length", None
         )
 
+        # Hybrid linear-attention models (e.g. Qwen3.5 / Qwen3-Next) keep a
+        # running per-sequence recurrent state, so KV blocks cannot be reused
+        # at arbitrary branch points and prefix caching would return garbage.
+        hf_config = getattr(model_config, "hf_config", None)
+        layer_types = getattr(hf_config, "layer_types", None)
+        is_hybrid_linear_attention = (
+            isinstance(layer_types, (list, tuple)) and "linear_attention" in layer_types
+        )
+        if (
+            is_hybrid_linear_attention
+            and vllm_config.cache_config is not None
+            and vllm_config.cache_config.enable_prefix_caching
+        ):
+            logger.warning(
+                "Prefix caching is not supported for hybrid linear-attention "
+                "models on Neuron; disabling it."
+            )
+            vllm_config.cache_config.enable_prefix_caching = False
+
         # Add 1 to num_gpu_blocks_override to account for lazy null block allocation
         cache_config = vllm_config.cache_config
         if (

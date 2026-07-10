@@ -320,6 +320,67 @@ def test_check_and_update_config_cache_validation():
         NeuronPlatform.check_and_update_config(mock_config)
 
 
+@pytest.mark.parametrize("enable_prefix_caching", [True, False])
+def test_check_and_update_config_hybrid_linear_attention_prefix_caching(
+    enable_prefix_caching,
+):
+    """Test that prefix caching is force-disabled for hybrid linear-attention
+    models (e.g. Qwen3.5 / Qwen3-Next).
+
+    Verifies:
+    - enable_prefix_caching is set to False when layer_types contains
+      "linear_attention"
+    - Non-hybrid models are unaffected by the guard
+    """
+    from transformers import PretrainedConfig
+
+    mock_config = Mock()
+    mock_config.model_config = Mock(max_model_len=2048)
+    mock_config.model_config.hf_config = PretrainedConfig(
+        num_hidden_layers=4,
+        layer_types=["linear_attention"] * 3 + ["full_attention"],
+    )
+    mock_config.parallel_config = Mock(world_size=1, worker_cls="auto")
+    mock_config.cache_config = Mock(
+        enable_prefix_caching=enable_prefix_caching,
+        block_size=32,
+        num_gpu_blocks_override=None,
+    )
+    mock_config.scheduler_config = Mock()
+    mock_config.lora_config = None
+
+    NeuronPlatform.check_and_update_config(mock_config)
+
+    assert mock_config.cache_config.enable_prefix_caching is False
+    # With prefix caching disabled, Neuron requires block_size = max_model_len
+    assert mock_config.cache_config.block_size == 2048
+
+
+def test_check_and_update_config_non_hybrid_prefix_caching_unchanged():
+    """Test that the hybrid guard leaves prefix caching enabled for standard
+    full-attention models."""
+    from transformers import PretrainedConfig
+
+    mock_config = Mock()
+    mock_config.model_config = Mock(max_model_len=2048)
+    mock_config.model_config.hf_config = PretrainedConfig(
+        num_hidden_layers=4,
+        layer_types=["full_attention"] * 4,
+    )
+    mock_config.parallel_config = Mock(world_size=1, worker_cls="auto")
+    mock_config.cache_config = Mock(
+        enable_prefix_caching=True,
+        block_size=32,
+        num_gpu_blocks_override=None,
+    )
+    mock_config.scheduler_config = Mock()
+    mock_config.lora_config = None
+
+    NeuronPlatform.check_and_update_config(mock_config)
+
+    assert mock_config.cache_config.enable_prefix_caching is True
+
+
 def test_pre_register_and_update_with_expert_parallel():
     """Test pre_register_and_update with expert parallelism.
 
