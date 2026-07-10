@@ -53,6 +53,15 @@ from vllm_neuron.worker.utils import get_num_layers_from_hf_config
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
+# VLLM_NEURON_PERF_DEBUG=1 surfaces the [PERF] logger.debug breakdowns
+# (per-step host-side timing: input prep, model execution, sampling, output
+# processing) regardless of the process logging config.
+if os.environ.get("VLLM_NEURON_PERF_DEBUG", "0") == "1":
+    logger.setLevel(logging.DEBUG)
+    _perf_handler = logging.StreamHandler()
+    _perf_handler.setLevel(logging.DEBUG)
+    logger.addHandler(_perf_handler)
+    logger.propagate = False
 
 
 def _mm_kwargs_to_device(
@@ -707,7 +716,8 @@ class NeuronxDistributedModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunner
             logger.info(
                 "Multi-pass CTE enabled: max_prompt_length overridden from %d "
                 "to max_model_len=%d (prompts will be chunked in forward()).",
-                mpl_nc_value, self.max_model_len,
+                mpl_nc_value,
+                self.max_model_len,
             )
             self.max_prompt_length = self.max_model_len
         else:
@@ -784,8 +794,12 @@ class NeuronxDistributedModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunner
                 logger.exception(
                     "execute_model forward FAILED (input_tokens shape=%s, "
                     "is_prefill=%s, total_scheduled=%d)",
-                    model_input.input_tokens.shape if model_input.input_tokens is not None else None,
-                    model_input.input_tokens.shape[1] > 1 if model_input.input_tokens is not None else None,
+                    model_input.input_tokens.shape
+                    if model_input.input_tokens is not None
+                    else None,
+                    model_input.input_tokens.shape[1] > 1
+                    if model_input.input_tokens is not None
+                    else None,
                     scheduler_output.total_num_scheduled_tokens,
                 )
                 raise
@@ -948,9 +962,7 @@ class NeuronxDistributedModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunner
             )
             if layer_type == "linear_attention":
                 continue
-            layer_name = (
-                f"layers.{layer_idx}.self_attn"  # standard naming convention
-            )
+            layer_name = f"layers.{layer_idx}.self_attn"  # standard naming convention
             kv_cache_spec[layer_name] = FullAttentionSpec(
                 block_size=self.block_size,
                 num_kv_heads=self.parallel_config.tensor_parallel_size,

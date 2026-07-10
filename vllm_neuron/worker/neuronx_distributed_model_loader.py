@@ -61,6 +61,16 @@ from vllm_neuron.worker.constants import (
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
+# VLLM_NEURON_PERF_DEBUG=1 surfaces the [PERF] logger.debug breakdowns
+# (forward, output processing, reorder/restore timing) regardless of the
+# process logging config.
+if os.environ.get("VLLM_NEURON_PERF_DEBUG", "0") == "1":
+    logger.setLevel(logging.DEBUG)
+    _perf_handler = logging.StreamHandler()
+    _perf_handler.setLevel(logging.DEBUG)
+    logger.addHandler(_perf_handler)
+    logger.propagate = False
+
 
 class NeuronModelBase(nn.Module):
     """
@@ -512,9 +522,11 @@ class NeuronCausalLM(NeuronModelBase):
             # avoiding potential KV workspace buffer overflow.  RoPE positions
             # will be incorrect for chunks beyond the first, but this is
             # acceptable for throughput benchmarking.
-            chunk_pos = torch.arange(
-                chunk_len, dtype=torch.long, device=input_ids.device
-            ).unsqueeze(0).expand(batch_size, -1)
+            chunk_pos = (
+                torch.arange(chunk_len, dtype=torch.long, device=input_ids.device)
+                .unsqueeze(0)
+                .expand(batch_size, -1)
+            )
             chunk_mask = torch.ones(
                 (batch_size, chunk_len), dtype=torch.long, device=input_ids.device
             )
@@ -544,11 +556,11 @@ class NeuronCausalLM(NeuronModelBase):
         model_elapsed = (time.perf_counter() - model_start) * 1000
         logger.info(
             "[PERF]     multi_pass_cte: %.2fms [%d passes, chunk=%d]",
-            model_elapsed, num_passes, max_cte,
+            model_elapsed,
+            num_passes,
+            max_cte,
         )
-        print(
-            f"[multi_pass_cte] Done: {model_elapsed:.1f}ms total", flush=True
-        )
+        print(f"[multi_pass_cte] Done: {model_elapsed:.1f}ms total", flush=True)
 
         # context_encoding_model() returns the raw tensor directly (sampled
         # token IDs when on_device_sampling, full logits otherwise).
@@ -556,9 +568,7 @@ class NeuronCausalLM(NeuronModelBase):
             output = output[:, -1, :]
 
         forward_elapsed = (time.perf_counter() - forward_start) * 1000
-        logger.info(
-            "[PERF]   multi_pass_forward() total: %.2fms", forward_elapsed
-        )
+        logger.info("[PERF]   multi_pass_forward() total: %.2fms", forward_elapsed)
         return output
 
     def forward(self, input_ids, input_block_ids, **kwargs):
