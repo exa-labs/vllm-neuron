@@ -125,6 +125,11 @@ class NeuronWorker(WorkerBase):
         blocks would correspond to.
 
         """
+        if self.model_config.runner_type == "pooling":
+            # KV-cache-free embedding path: no cache memory is needed, but the
+            # engine requires a positive block budget for its dummy KV config.
+            return self.cache_config.block_size or 1
+
         if self.model_runner.is_block_kv_layout:
             return self._query_runtime_memory()
 
@@ -141,6 +146,13 @@ class NeuronWorker(WorkerBase):
         raise NotImplementedError
 
     def get_neuronx_distributed_model_runner(self, vllm_config, device):
+        if vllm_config.model_config.runner_type == "pooling":
+            from vllm_neuron.worker.nemotron_embed_runner import (
+                NemotronEmbedModelRunner,
+            )
+
+            return NemotronEmbedModelRunner(vllm_config=vllm_config, device=device)
+
         from vllm_neuron.worker.neuronx_distributed_model_runner import (
             NeuronxDistributedModelRunner,
         )
@@ -219,6 +231,8 @@ class NeuronWorker(WorkerBase):
         return self.model_runner.list_loras()
 
     def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
+        if self.model_config.runner_type == "pooling":
+            return ("embed",)
         supported_tasks = list[GenerationTask]()
         supported_tasks.append("generate")
         return supported_tasks

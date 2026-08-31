@@ -281,16 +281,25 @@ class NeuronPlatform(Platform):
         return "vllm_neuron.attention.neuron_attn.NeuronAttentionBackend"
 
     @classmethod
+    def _register_oot_models(cls) -> None:
+        """Register Neuron-served embedding models with vLLM's registries."""
+        from vllm_neuron.models import register_nemotron_embed
+
+        register_nemotron_embed()
+
+    @classmethod
     def pre_register_and_update(
         cls, parser: "FlexibleArgumentParser | None" = None
     ) -> None:
         # Apply config overrides here - this is called before VllmConfig is created
         cls._apply_config_overrides()
+        cls._register_oot_models()
 
     @classmethod
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
         # Ensure config overrides are applied (in case pre_register_and_update wasn't called)
         cls._apply_config_overrides()
+        cls._register_oot_models()
         # Apply OpenAI overrides now that vLLM is fully loaded
         cls._apply_openai_overrides()
         # Apply engine client override for external DP
@@ -305,6 +314,25 @@ class NeuronPlatform(Platform):
         # checking if the VllmConfig.model_config is None.
         model_config = vllm_config.model_config
         if model_config is None:
+            return
+
+        if model_config.runner_type == "pooling":
+            # Embedding path: single-forward, no KV cache. Use the native vLLM
+            # scheduler with chunked prefill off so every request is scheduled
+            # as one whole prompt (the pooling runner rejects partial prompts).
+            vllm_config.scheduler_config.enable_chunked_prefill = False
+            vllm_config.scheduler_config.max_num_batched_tokens = max(
+                vllm_config.scheduler_config.max_num_batched_tokens or 0,
+                model_config.max_model_len
+                * (vllm_config.scheduler_config.max_num_seqs or 32),
+            )
+            if vllm_config.cache_config is not None:
+                vllm_config.cache_config.block_size = model_config.max_model_len
+            parallel_config = vllm_config.parallel_config
+            if parallel_config.worker_cls == "auto":
+                parallel_config.worker_cls = (
+                    "vllm_neuron.worker.neuron_worker.NeuronWorker"
+                )
             return
 
         disable_scheduler_override = bool(
