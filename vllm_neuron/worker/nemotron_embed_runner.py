@@ -79,9 +79,30 @@ class NemotronEmbedModelRunner:
             hf_config = json.load(f)
         self.pad_token_id = hf_config.get("pad_token_id", 11)
         self.hidden_size = hf_config.get("hidden_size", 4096)
-        model_path = os.path.join(self.artifact_dir, "model.pt")
-        logger.info("Loading NxD embedding artifact from %s", model_path)
-        self.model = NxDModel.load(model_path)
+        files = manifest.get("files", {})
+        weightless = files.get("weightless")
+        if weightless and os.path.exists(
+            os.path.join(self.artifact_dir, weightless)
+        ):
+            # Low-host-RAM layout: weightless torchscript + per-rank
+            # safetensors loaded zero-copy via mmap, so the ~16 GiB of
+            # weights never fully materialize in host RAM (inf2.xlarge has
+            # only 16 GiB) before streaming to the NeuronCores.
+            from safetensors.torch import load_file
+
+            model_path = os.path.join(self.artifact_dir, weightless)
+            logger.info("Loading weightless NxD artifact from %s", model_path)
+            self.model = NxDModel.load(model_path)
+            sharded = [
+                load_file(os.path.join(self.artifact_dir, rank_file))
+                for rank_file in files["rank_weights"]
+            ]
+            self.model.set_weights(sharded)
+            self.model.to_neuron()
+        else:
+            model_path = os.path.join(self.artifact_dir, "model.pt")
+            logger.info("Loading NxD embedding artifact from %s", model_path)
+            self.model = NxDModel.load(model_path)
 
     def _bucket_for(self, length: int) -> _Bucket:
         for bucket in self.buckets:
