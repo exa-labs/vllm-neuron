@@ -19,6 +19,12 @@ Enable with::
 
     --runner pooling --additional-config \
         '{"nemotron_embed_artifact_dir": "/path/with/model.pt+manifest.json"}'
+
+With ``"nemotron_embed_weights_uri": "s3://bucket/artifact/prefix"`` as well,
+the per-rank safetensors of a weightless artifact are streamed from that S3
+prefix straight into the NeuronCores (``nemotron_weight_stream``) instead of
+read from the artifact dir, which then needs only the manifest, config and
+weightless torchscript.
 """
 
 import json
@@ -58,6 +64,7 @@ class NemotronEmbedModelRunner:
                 '\'{"nemotron_embed_artifact_dir": "..."}\' pointing at a '
                 "nemotron-nxd-tp2-v1 artifact directory"
             )
+        self.weights_uri = additional.get("nemotron_embed_weights_uri")
         self.model = None
         self.buckets: list[_Bucket] = []
         self.pad_token_id: int = 11
@@ -72,7 +79,10 @@ class NemotronEmbedModelRunner:
             manifest = json.load(f)
         assert manifest["schema"] == "nemotron-nxd-tp2-v1", manifest["schema"]
         self.buckets = sorted(
-            (_Bucket(b["seq_len"], b["batch_size"], b["tag"]) for b in manifest["buckets"]),
+            (
+                _Bucket(b["seq_len"], b["batch_size"], b["tag"])
+                for b in manifest["buckets"]
+            ),
             key=lambda b: b.seq_len,
         )
         with open(os.path.join(self.artifact_dir, "config.json")) as f:
@@ -81,9 +91,28 @@ class NemotronEmbedModelRunner:
         self.hidden_size = hf_config.get("hidden_size", 4096)
         files = manifest.get("files", {})
         weightless = files.get("weightless")
-        if weightless and os.path.exists(
-            os.path.join(self.artifact_dir, weightless)
-        ):
+        if self.weights_uri:
+            if not weightless:
+                raise ValueError(
+                    "nemotron_embed_weights_uri needs a weightless artifact; the "
+                    f"manifest in {self.artifact_dir} names no files.weightless"
+                )
+            from vllm_neuron.worker.nemotron_weight_stream import (
+                S3RangeReader,
+                stream_rank_weights,
+            )
+
+            model_path = os.path.join(self.artifact_dir, weightless)
+            prefix = self.weights_uri.rstrip("/")
+            rank_uris = [f"{prefix}/{rank_file}" for rank_file in files["rank_weights"]]
+            logger.info(
+                "Loading weightless NxD artifact from %s, streaming weights from %s",
+                model_path,
+                rank_uris,
+            )
+            self.model = NxDModel.load(model_path)
+            stream_rank_weights(self.model, S3RangeReader(), rank_uris)
+        elif weightless and os.path.exists(os.path.join(self.artifact_dir, weightless)):
             # Low-host-RAM layout: weightless torchscript + per-rank
             # safetensors loaded zero-copy via mmap, so the ~16 GiB of
             # weights never fully materialize in host RAM (inf2.xlarge has
@@ -146,7 +175,9 @@ class NemotronEmbedModelRunner:
         req_ids = [r.req_id for r in reqs]
         by_bucket: dict[_Bucket, list[int]] = {}
         for i, req in enumerate(reqs):
-            by_bucket.setdefault(self._bucket_for(len(req.prompt_token_ids)), []).append(i)
+            by_bucket.setdefault(
+                self._bucket_for(len(req.prompt_token_ids)), []
+            ).append(i)
 
         pooler_output: list[torch.Tensor | None] = [None] * len(reqs)
         for bucket, indices in by_bucket.items():
