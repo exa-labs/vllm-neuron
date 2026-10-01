@@ -6,3 +6,4 @@ urllib3>=2.6.0
 # vLLM installation
 vllm==0.16.0
 neuronx-distributed-inference>=0.7
+boto3
