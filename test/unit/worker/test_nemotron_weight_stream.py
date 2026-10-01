@@ -3,6 +3,7 @@
 
 import struct
 import threading
+import warnings
 
 import pytest
 import torch
@@ -10,6 +11,7 @@ from safetensors.torch import save
 
 from vllm_neuron.worker.nemotron_weight_stream import (
     Chunk,
+    S3RangeReader,
     TensorSlice,
     header_length,
     parse_header,
@@ -240,3 +242,103 @@ def test_s3_uris_split_into_bucket_and_key():
     for invalid in ["models/a", "s3://models", "s3:///key"]:
         with pytest.raises(ValueError):
             split_s3_uri(invalid)
+
+
+def test_empty_tensors_get_a_buffer_but_no_get():
+    shard = {"empty": torch.zeros(0, 4), **rank_shard(0)}
+    objects, uris = objects_for([shard])
+    reader = BytesReader(objects)
+    model = FakeNxDModel()
+
+    stream_rank_weights(model, reader, uris, chunk_bytes=1)
+
+    assert model.placeholders[0]["empty"].shape == (0, 4)
+    assert "empty" not in {name for _, name in model.writes}
+    assert len(reader.ranges) == 2 + len(rank_shard(0))
+    for name, expected in rank_shard(0).items():
+        assert torch.equal(model.device[0][name], expected), name
+
+
+def test_plan_chunks_skips_empty_tensors():
+    chunks = plan_chunks(slices((0, 4), (4, 4), (4, 8)), chunk_bytes=1 << 20)
+    assert [(chunk.start, chunk.end) for chunk in chunks] == [(0, 8)]
+    assert [tensor.name for tensor in chunks[0].tensors] == ["t0", "t2"]
+
+
+def test_tensors_of_views_the_bytes_without_copying_or_warning():
+    chunk = Chunk(0, 8, (TensorSlice("w", torch.float32, (2,), 0, 8),))
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        ((tensor, view),) = tensors_of(chunk, b"\x00\x00\x80\x3f\x00\x00\x00\x40")
+    assert tensor.name == "w"
+    assert torch.equal(view, torch.tensor([1.0, 2.0]))
+
+
+class _Body:
+    def __init__(self, data: bytes, error: Exception | None = None):
+        self._data, self._error = data, error
+
+    def read(self) -> bytes:
+        if self._error is not None:
+            raise self._error
+        return self._data
+
+
+class FlakyS3Client:
+    """get_object that fails in scripted ways before serving the range."""
+
+    def __init__(self, data: bytes, failures: list[Exception | bytes]):
+        self.data = data
+        self.failures = list(failures)
+        self.calls: list[str] = []
+
+    def get_object(self, Bucket: str, Key: str, Range: str):
+        self.calls.append(Range)
+        start, end = (int(x) for x in Range.removeprefix("bytes=").split("-"))
+        if self.failures:
+            failure = self.failures.pop(0)
+            if isinstance(failure, bytes):
+                return {"Body": _Body(failure)}
+            if isinstance(failure, ConnectionError):
+                return {"Body": _Body(b"", failure)}
+            raise failure
+        return {"Body": _Body(self.data[start : end + 1])}
+
+
+def client_error(status: int):
+    from botocore.exceptions import ClientError
+
+    return ClientError(
+        {
+            "Error": {"Code": str(status)},
+            "ResponseMetadata": {"HTTPStatusCode": status},
+        },
+        "GetObject",
+    )
+
+
+def test_dropped_bodies_short_reads_and_5xx_are_retried():
+    client = FlakyS3Client(
+        bytes(range(64)),
+        [ConnectionError("reset by peer"), b"\x00\x01", client_error(503)],
+    )
+    naps: list[float] = []
+
+    data = S3RangeReader(client, attempts=4, sleep=naps.append).read("s3://b/k", 8, 16)
+
+    assert data == bytes(range(8, 16))
+    assert client.calls == ["bytes=8-15"] * 4
+    assert len(naps) == 3
+
+
+def test_a_missing_key_is_not_retried():
+    client = FlakyS3Client(b"", [client_error(404)])
+    with pytest.raises(Exception, match="404"):
+        S3RangeReader(client, attempts=4, sleep=lambda _: None).read("s3://b/k", 0, 8)
+    assert len(client.calls) == 1
+
+
+def test_the_last_attempt_raises():
+    client = FlakyS3Client(b"", [ConnectionError("a"), ConnectionError("b")])
+    with pytest.raises(ConnectionError, match="b"):
+        S3RangeReader(client, attempts=2, sleep=lambda _: None).read("s3://b/k", 0, 8)

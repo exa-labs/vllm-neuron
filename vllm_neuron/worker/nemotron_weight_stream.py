@@ -32,6 +32,7 @@ import json
 import logging
 import struct
 import time
+import warnings
 from collections.abc import Callable, Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
@@ -64,6 +65,9 @@ DEFAULT_CHUNK_BYTES = 256 * 1024 * 1024
 
 #: Default number of chunks fetched ahead of the device writes.
 DEFAULT_PREFETCH = 4
+
+#: Default number of times one ranged GET is attempted before the load fails.
+DEFAULT_READ_ATTEMPTS = 4
 
 #: The safetensors format caps its JSON header at 100 MB; a larger declared
 #: length means the bytes are not a safetensors file.
@@ -174,13 +178,16 @@ def plan_chunks(slices: list[TensorSlice], chunk_bytes: int) -> list[Chunk]:
 
     Consecutive tensors share a GET while their bytes are adjacent and the
     GET stays within budget; a tensor larger than the budget is a GET of its
-    own. Every tensor lands in exactly one chunk.
+    own. Every tensor with bytes lands in exactly one chunk; an empty tensor
+    has nothing to fetch and its device buffer nothing to receive.
     """
     if chunk_bytes <= 0:
         raise ValueError(f"chunk_bytes must be positive, got {chunk_bytes}")
     chunks: list[Chunk] = []
     current: list[TensorSlice] = []
     for tensor in slices:
+        if tensor.nbytes == 0:
+            continue
         if current and (
             tensor.start != current[-1].end
             or tensor.end - current[0].start > chunk_bytes
@@ -206,12 +213,15 @@ def tensors_of(chunk: Chunk, data: bytes) -> Iterator[tuple[TensorSlice, torch.T
         raise ValueError(
             f"ranged read of [{chunk.start}, {chunk.end}) returned {len(data)} bytes"
         )
-    buffer = bytearray(data)
     for tensor in chunk.tensors:
         numel = tensor.nbytes // torch.empty((), dtype=tensor.dtype).element_size()
-        view = torch.frombuffer(
-            buffer, dtype=tensor.dtype, count=numel, offset=tensor.start - chunk.start
-        )
+        with warnings.catch_warnings():
+            # The views are only ever read from (``copy_`` sources), so the
+            # read-only ``bytes`` need not be copied into a writable buffer.
+            warnings.simplefilter("ignore", UserWarning)
+            view = torch.frombuffer(
+                data, dtype=tensor.dtype, count=numel, offset=tensor.start - chunk.start
+            )
         yield tensor, view.reshape(tensor.shape)
 
 
@@ -293,20 +303,66 @@ class S3RangeReader:
 
     With the endpoint pointed at an S3-compatible cache on the node, repeat
     loads are served from that cache; otherwise the reads go to S3.
-    Retries are botocore's (``AWS_MAX_ATTEMPTS``, ``AWS_RETRY_MODE``).
+
+    botocore only retries the request itself; a connection dropped while the
+    body is being read, or a body shorter than the range, surfaces as an
+    exception here. Those are retried by re-issuing the ranged GET up to
+    ``attempts`` times in total, with a short backoff; client errors other
+    than throttling (a missing key, denied access) fail at once.
     """
 
-    def __init__(self, client: Any = None):
+    def __init__(
+        self,
+        client: Any = None,
+        *,
+        attempts: int = DEFAULT_READ_ATTEMPTS,
+        sleep: Callable[[float], None] = time.sleep,
+    ):
         if client is None:
             import boto3
             from botocore.config import Config
 
             client = boto3.client("s3", config=Config(max_pool_connections=32))
+        if attempts <= 0:
+            raise ValueError(f"attempts must be positive, got {attempts}")
         self._client = client
+        self._attempts = attempts
+        self._sleep = sleep
 
     def read(self, uri: str, start: int, end: int) -> bytes:
         bucket, key = split_s3_uri(uri)
-        response = self._client.get_object(
-            Bucket=bucket, Key=key, Range=f"bytes={start}-{end - 1}"
-        )
-        return response["Body"].read()
+        for attempt in range(1, self._attempts + 1):
+            try:
+                response = self._client.get_object(
+                    Bucket=bucket, Key=key, Range=f"bytes={start}-{end - 1}"
+                )
+                data = response["Body"].read()
+                if len(data) != end - start:
+                    raise ValueError(
+                        f"ranged read of {uri} [{start}, {end}) returned {len(data)} bytes"
+                    )
+                return data
+            except Exception as error:
+                if attempt == self._attempts or not _is_transient(error):
+                    raise
+                logger.warning(
+                    "ranged read of %s [%d, %d) failed on attempt %d/%d: %s",
+                    uri,
+                    start,
+                    end,
+                    attempt,
+                    self._attempts,
+                    error,
+                )
+                self._sleep(min(2.0**attempt, 10.0))
+        raise AssertionError("unreachable")
+
+
+def _is_transient(error: Exception) -> bool:
+    """Whether re-issuing the GET could succeed: anything but a non-throttling 4xx."""
+    from botocore.exceptions import ClientError
+
+    if not isinstance(error, ClientError):
+        return True
+    status = error.response.get("ResponseMetadata", {}).get("HTTPStatusCode", 500)
+    return status >= 500 or status == 429
