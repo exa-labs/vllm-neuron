@@ -338,6 +338,15 @@ def test_a_missing_key_is_not_retried():
     assert len(client.calls) == 1
 
 
+def test_a_bug_in_the_read_path_is_not_retried():
+    class Broken:
+        def get_object(self, **_):
+            raise TypeError("not a transport error")
+
+    with pytest.raises(TypeError):
+        S3RangeReader(Broken(), attempts=4, sleep=lambda _: None).read("s3://b/k", 0, 8)
+
+
 def test_the_last_attempt_raises():
     client = FlakyS3Client(b"", [ConnectionError("a"), ConnectionError("b")])
     with pytest.raises(ConnectionError, match="b"):

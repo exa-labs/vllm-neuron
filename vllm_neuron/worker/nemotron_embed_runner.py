@@ -79,10 +79,7 @@ class NemotronEmbedModelRunner:
             manifest = json.load(f)
         assert manifest["schema"] == "nemotron-nxd-tp2-v1", manifest["schema"]
         self.buckets = sorted(
-            (
-                _Bucket(b["seq_len"], b["batch_size"], b["tag"])
-                for b in manifest["buckets"]
-            ),
+            (_Bucket(b["seq_len"], b["batch_size"], b["tag"]) for b in manifest["buckets"]),
             key=lambda b: b.seq_len,
         )
         with open(os.path.join(self.artifact_dir, "config.json")) as f:
@@ -112,7 +109,9 @@ class NemotronEmbedModelRunner:
             )
             self.model = NxDModel.load(model_path)
             stream_rank_weights(self.model, S3RangeReader(), rank_uris)
-        elif weightless and os.path.exists(os.path.join(self.artifact_dir, weightless)):
+        elif weightless and os.path.exists(
+            os.path.join(self.artifact_dir, weightless)
+        ):
             # Low-host-RAM layout: weightless torchscript + per-rank
             # safetensors loaded zero-copy via mmap, so the ~16 GiB of
             # weights never fully materialize in host RAM (inf2.xlarge has
@@ -175,9 +174,7 @@ class NemotronEmbedModelRunner:
         req_ids = [r.req_id for r in reqs]
         by_bucket: dict[_Bucket, list[int]] = {}
         for i, req in enumerate(reqs):
-            by_bucket.setdefault(
-                self._bucket_for(len(req.prompt_token_ids)), []
-            ).append(i)
+            by_bucket.setdefault(self._bucket_for(len(req.prompt_token_ids)), []).append(i)
 
         pooler_output: list[torch.Tensor | None] = [None] * len(reqs)
         for bucket, indices in by_bucket.items():

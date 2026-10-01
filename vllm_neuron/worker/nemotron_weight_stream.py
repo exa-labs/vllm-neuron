@@ -40,6 +40,7 @@ from itertools import pairwise
 from typing import Any, Protocol
 
 import torch
+from botocore.exceptions import BotoCoreError, ClientError
 
 logger = logging.getLogger(__name__)
 
@@ -97,6 +98,10 @@ class Chunk:
     start: int
     end: int
     tensors: tuple[TensorSlice, ...]
+
+
+class ShortRead(Exception):
+    """A ranged GET returned fewer bytes than the range it was asked for."""
 
 
 class RangeReader(Protocol):
@@ -306,9 +311,11 @@ class S3RangeReader:
 
     botocore only retries the request itself; a connection dropped while the
     body is being read, or a body shorter than the range, surfaces as an
-    exception here. Those are retried by re-issuing the ranged GET up to
-    ``attempts`` times in total, with a short backoff; client errors other
-    than throttling (a missing key, denied access) fail at once.
+    exception here. Transport errors (``OSError``, botocore's own errors,
+    5xx and throttling responses) and short bodies are retried by re-issuing
+    the ranged GET up to ``attempts`` times in total, with a short backoff.
+    Anything else, including other client errors (a missing key, denied
+    access), fails at once.
     """
 
     def __init__(
@@ -338,11 +345,11 @@ class S3RangeReader:
                 )
                 data = response["Body"].read()
                 if len(data) != end - start:
-                    raise ValueError(
+                    raise ShortRead(
                         f"ranged read of {uri} [{start}, {end}) returned {len(data)} bytes"
                     )
                 return data
-            except Exception as error:
+            except (OSError, BotoCoreError, ClientError, ShortRead) as error:
                 if attempt == self._attempts or not _is_transient(error):
                     raise
                 logger.warning(
@@ -360,8 +367,6 @@ class S3RangeReader:
 
 def _is_transient(error: Exception) -> bool:
     """Whether re-issuing the GET could succeed: anything but a non-throttling 4xx."""
-    from botocore.exceptions import ClientError
-
     if not isinstance(error, ClientError):
         return True
     status = error.response.get("ResponseMetadata", {}).get("HTTPStatusCode", 500)
